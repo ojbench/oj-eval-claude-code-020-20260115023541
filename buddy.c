@@ -20,14 +20,21 @@ static void *base_addr = NULL;
 static int total_pages = 0;
 static block_t *free_lists[MAX_RANK + 1];  // Index 1-16
 
+// Bitmap to track which blocks are in free lists
+// For each rank, we track which blocks are free using a bitmap
+// Each bit represents whether a block of that rank starting at that position is free
+static unsigned long free_bitmap[MAX_RANK + 1][2048];  // Support up to 128MB per rank
+
 // Use a byte array to track allocation status
-// For each page (4K), we store the rank if allocated, 0 if free
-// We only need to track the first page of each block
 static unsigned char alloc_map[32768];  // Support up to 32K pages
 
 // Helper function to calculate block size for a given rank
 static inline int rank_to_size(int rank) {
     return PAGE_SIZE * (1 << (rank - 1));
+}
+
+static inline int rank_to_pages(int rank) {
+    return 1 << (rank - 1);
 }
 
 // Helper function to get buddy address
@@ -42,6 +49,12 @@ static inline int addr_to_page_idx(void *p) {
     return ((uintptr_t)p - (uintptr_t)base_addr) / PAGE_SIZE;
 }
 
+// Helper function to get block index for bitmap
+static inline int get_block_idx(void *addr, int rank) {
+    uintptr_t offset = (uintptr_t)addr - (uintptr_t)base_addr;
+    return offset / rank_to_size(rank);
+}
+
 // Helper function to check if address is within valid range
 static inline int is_valid_addr(void *p) {
     if (p == NULL || base_addr == NULL) return 0;
@@ -50,7 +63,7 @@ static inline int is_valid_addr(void *p) {
     return (offset % PAGE_SIZE) == 0;
 }
 
-// Add block to free list
+// Add block to free list and bitmap
 static void add_to_free_list(void *addr, int rank) {
     block_t *block = (block_t *)addr;
     block->next = free_lists[rank];
@@ -59,9 +72,14 @@ static void add_to_free_list(void *addr, int rank) {
         free_lists[rank]->prev = block;
     }
     free_lists[rank] = block;
+
+    // Mark in bitmap
+    int block_idx = get_block_idx(addr, rank);
+    free_bitmap[rank][block_idx / (sizeof(unsigned long) * 8)] |=
+        (1UL << (block_idx % (sizeof(unsigned long) * 8)));
 }
 
-// Remove block from free list
+// Remove block from free list and bitmap
 static void remove_from_free_list(void *addr, int rank) {
     block_t *block = (block_t *)addr;
     if (block->prev != NULL) {
@@ -72,18 +90,18 @@ static void remove_from_free_list(void *addr, int rank) {
     if (block->next != NULL) {
         block->next->prev = block->prev;
     }
+
+    // Clear from bitmap
+    int block_idx = get_block_idx(addr, rank);
+    free_bitmap[rank][block_idx / (sizeof(unsigned long) * 8)] &=
+        ~(1UL << (block_idx % (sizeof(unsigned long) * 8)));
 }
 
-// Check if block is in free list (optimized - early exit)
-static int is_in_free_list(void *addr, int rank) {
-    block_t *block = free_lists[rank];
-    while (block != NULL) {
-        if (block == (block_t *)addr) {
-            return 1;
-        }
-        block = block->next;
-    }
-    return 0;
+// Check if block is in free list using bitmap (O(1))
+static inline int is_in_free_list(void *addr, int rank) {
+    int block_idx = get_block_idx(addr, rank);
+    return (free_bitmap[rank][block_idx / (sizeof(unsigned long) * 8)] &
+            (1UL << (block_idx % (sizeof(unsigned long) * 8)))) != 0;
 }
 
 // Initialize pages
@@ -95,8 +113,9 @@ int init_page(void *p, int pgcount) {
     base_addr = p;
     total_pages = pgcount;
 
-    // Clear allocation map
+    // Clear allocation map and bitmap
     memset(alloc_map, 0, sizeof(alloc_map));
+    memset(free_bitmap, 0, sizeof(free_bitmap));
 
     // Initialize all free lists to NULL
     for (int i = 1; i <= MAX_RANK; i++) {
@@ -182,7 +201,7 @@ int return_pages(void *p) {
     while (current_rank < MAX_RANK) {
         void *buddy = get_buddy(current_addr, current_rank);
 
-        // Check if buddy is in free list
+        // Check if buddy is in free list (O(1) lookup)
         if (!is_in_free_list(buddy, current_rank)) {
             break;
         }
